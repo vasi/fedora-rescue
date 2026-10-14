@@ -62,7 +62,9 @@ class Snapper
   def setup_fstab!(fs_uuid)
     fstab = root.join('etc', 'fstab')
     File.open(fstab, 'a') do |f|
-      f.puts("UUID=#{fs_uuid} /swap btrfs subvol=root/swap 0 0")
+      if Pathname.new('/swap').mountpoint?
+        f.puts("UUID=#{fs_uuid} /swap btrfs subvol=root/swap 0 0")
+      end
       f.puts("UUID=#{fs_uuid} /.snapshots btrfs subvol=root/.snapshots 0 0")
     end
   end

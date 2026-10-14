@@ -1,0 +1,7 @@
+[Unit]
+Description=Update rescue snapshots
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/update-rescue-snapshots
+

@@ -1,0 +1,11 @@
+[Unit]
+Description=Update rescue snapshots hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Unit=update-rescue-snapshots.service
+
+[Install]
+WantedBy=timers.target
