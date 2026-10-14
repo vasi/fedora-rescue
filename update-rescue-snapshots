@@ -1,0 +1,229 @@
+#!/usr/bin/env ruby
+
+require 'etc'
+require 'json'
+require 'open3'
+require 'pathname'
+require 'set'
+
+TimeFormat = '%F %T'
+
+def capture!(*cmd)
+  stdout, stderr, status = Open3.capture3(*cmd)
+  raise "Failure in #{cmd.join(' ')}: #{stderr}" unless status.success?
+  stdout.chomp
+end  
+
+module System
+  def self.findmnt(mnt, col)
+    capture!('findmnt', '--noheadings', '-T', mnt, '-o', col)
+  end
+  def self.fsroot(mnt); findmnt(mnt, 'FSROOT'); end
+  def self.uuid(mnt); findmnt(mnt, 'UUID'); end
+
+  def self.kernel_release
+    Etc.uname[:release]
+  end
+  def self.kernel_exists?(release)
+    File.exist?("/boot/vmlinuz-#{release}")
+  end
+  def self.cmdline
+    File.read('/proc/cmdline')
+  end
+end
+
+class Snapper
+  attr_reader :id, :time
+
+  def initialize(id, time)
+    @id, @time = id.to_i, Time.at(time.to_i)
+  end
+
+  def self.run!(*cmd)
+    capture!('snapper', '-c', 'root', *cmd)
+  end
+  
+  def self.list
+    json = run!('--jsonout', 'list')
+    data = JSON.parse!(json)
+    data['root'].filter_map do |snap|
+      time = snap.dig('userdata', 'rescue') or next nil
+      Snapper.new(snap['number'], time)
+    end
+  end
+
+  def root
+    Pathname.new('/.snapshots').join(@id.to_s, 'snapshot')
+  end
+  def subvol_path
+    "root/.snapshots/#@id/snapshot"
+  end
+
+  def setup_fstab!(fs_uuid)
+    fstab = root.join('etc', 'fstab')
+    File.open(fstab, 'a') do |f|
+      f.puts("UUID=#{fs_uuid} /swap btrfs subvol=root/swap 0 0")
+      f.puts("UUID=#{fs_uuid} /.snapshots btrfs subvol=root/.snapshots 0 0")
+    end
+  end
+
+  def self.create!(time, fs_uuid)
+    id = run!('create', '--userdata', "rescue=#{time.to_i}", '--read-write',
+      '--description', "rescue #{time.to_i}", '--print-number')
+    snap = Snapper.new(id, time)
+    snap.setup_fstab!(fs_uuid)
+    snap
+  end
+
+  def delete!
+    Snapper.run!('delete', @id.to_s)
+  end
+end
+
+class Fragment
+  FragmentsDir = Pathname.new('/boot/grub2/rescue')
+  Day = 86400
+  MaxAgeDays = 7
+
+  attr_reader :time, :path, :snap
+
+  def initialize(path, time, snap)
+    @path, @time, @snap = path, Time.at(time.to_i), snap
+  end
+
+  def self.read(path, snaps)
+    md = /^(\d+)\.cfg/.match(path.basename.to_s) or raise "Can't parse #{path}"
+    time = Time.at(md[1].to_i)
+    Fragment.new(path, md[1], snaps.find { it.time == time })
+  end
+  def self.list
+    return [] unless FragmentsDir.directory?
+    snaps = Snapper.list
+    FragmentsDir.glob('*.cfg').map { Fragment.read(it, snaps) }.sort_by(&:time)
+  end
+
+  def self.build_cmdline(snap)
+    System.cmdline \
+      .gsub(/\b(BOOT_IMAGE=\S+|rhgb|quiet)\b/, '') \
+      .sub(/(rootflags=subvol)=root/, "\\1=#{snap.subvol_path}")
+  end
+
+  def self.create!
+    release = System.kernel_release
+    return nil unless System.kernel_exists?(release)
+
+    time = Time.now
+    uuid = System.uuid('/')
+    boot_uuid = System.uuid('/boot')
+
+    snap = Snapper.create!(time, uuid)
+
+    entry = <<~EOF
+      menuentry '#{time.strftime(TimeFormat)}' --id=rescue-snapshot-#{time.to_i} {
+        insmod part_gpt
+        insmod ext2
+        search --no-floppy --fs-uuid --set=root #{boot_uuid}
+        linux /vmlinuz-#{release} #{build_cmdline(snap)}
+        initrd /initramfs-#{release}.img $tuned_initrd
+      }
+    EOF
+    path = FragmentsDir.join("#{time.to_i}.cfg")
+    path.dirname.mkpath
+    path.write(entry)
+    Fragment.new(path, time, snap)
+  end
+  def self.create_or_complain!
+    if frag = Fragment.create!
+      $stderr.puts "Created new snapshot #{frag.time.to_i}"
+    else
+      $stderr.puts "Couldn't create an entry"
+    end    
+  end
+
+  def delete!
+    snap&.delete!
+    path.delete
+  end
+
+  def release
+    path.read.scan(%r<linux /vmlinuz-(\S+)>).flatten.first
+  end
+  def invalid?
+    snap.nil? || !System.kernel_exists?(release)
+  end
+  def outdated?
+    (Time.now - time) > Day * MaxAgeDays
+  end
+
+  def self.cleanup!
+    times = Set.new
+    Fragment.list.each do |frag|
+      if frag.invalid? || frag.outdated?
+        $stderr.puts "Cleaning up fragment #{frag.time.to_i}"
+        frag.delete!
+      else
+        times << frag.time
+      end
+    end
+    Snapper.list.each do |snap|
+      unless times.include?(snap.time)
+        puts "Cleaning up snapshot #{snap.time.to_i}"
+        snap.delete!
+      end
+    end
+  end
+
+  def self.recent?
+    recent = Fragment.list.max_by(&:time)
+    recent && (Time.now - recent.time) < Day
+  end
+
+  def self.build_loader!
+    includes = Fragment.list.reverse.map do |f|
+       "    source \$prefix/rescue/#{f.path.basename}"
+    end
+    submenu = <<~EOF
+      submenu "Rescue snapshots" --id=rescue {
+      #{includes.join("\n")}
+      }
+    EOF
+    Pathname.new('/boot/grub2/rescue.cfg').write(submenu)
+  end
+end
+
+def check_root!
+  if System.fsroot('/') != '/root'
+    $stderr.puts "Not booted from /root, exiting"
+    exit -1
+  end
+end
+
+def run!(args)
+  check_root!
+  command = args.shift
+
+  Fragment.cleanup!
+
+  if command == 'create'
+    Fragment.create_or_complain!
+  elsif command == 'list'
+    Fragment.list.reverse.each do |f|
+      puts "#{f.time.to_i}   #{f.time.strftime(TimeFormat)}"
+    end
+  elsif command == 'delete'
+    id = args.shift.to_i
+    frag = Fragment.list.find { it.time.to_i == id }
+    raise "No fragment #{id}" unless frag
+    frag.delete!
+  elsif command == nil || command == 'auto'
+    exit 0 if Fragment.recent?
+    Fragment.create_or_complain!
+  else
+    $stderr.puts "Unknown command '#{command}'"
+    exit -2
+  end
+  Fragment.build_loader!
+end
+
+run!(ARGV)
+
